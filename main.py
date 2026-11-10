@@ -8,6 +8,8 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Bac
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
@@ -23,6 +25,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Fortnite Chest AI")
 replay_jobs = {}
+replay_db_lock = threading.Lock()
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 @contextmanager
@@ -311,79 +314,109 @@ def my_replays(request: Request):
     return {"replays": [dict(r) for r in rows]}
 
 
-def process_replay_batch(job_id, user_id, pseudo, files):
-    job = replay_jobs[job_id]
 
-    for item in files:
-        result_item = {
-            "filename": item["filename"],
-            "ok": False,
-            "error": ""
-        }
-        path = Path(item["path"])
+def process_one_replay(item, user_id, pseudo):
+    result_item = {
+        "filename": item["filename"],
+        "ok": False,
+        "error": ""
+    }
+    path = Path(item["path"])
 
-        try:
-            if item.get("error"):
-                raise ValueError(item["error"])
+    try:
+        if item.get("error"):
+            raise ValueError(item["error"])
 
+        with replay_db_lock:
             with db() as con:
                 duplicate = con.execute(
                     "SELECT id FROM replays WHERE sha256=?",
                     (item["sha256"],)
                 ).fetchone()
 
-            if duplicate:
-                raise ValueError("Cette rediffusion a déjà été envoyée.")
+        if duplicate:
+            raise ValueError("Cette rediffusion a déjà été envoyée.")
 
-            result, note = analyze_replay(path, pseudo)
+        result, note = analyze_replay(path, pseudo)
 
-            if not result:
-                raise ValueError(note or "Rediffusion non analysable.")
+        if not result:
+            raise ValueError(note or "Rediffusion non analysable.")
 
+        with replay_db_lock:
             with db() as con:
+                duplicate = con.execute(
+                    "SELECT id FROM replays WHERE sha256=?",
+                    (item["sha256"],)
+                ).fetchone()
+
                 duplicate_match = con.execute(
                     "SELECT id FROM replays WHERE match_id=? AND status='analyzed'",
                     (result["match_id"],)
                 ).fetchone()
 
-            if duplicate_match:
-                raise ValueError("Cette partie a déjà été comptabilisée.")
+                if duplicate:
+                    raise ValueError("Cette rediffusion a déjà été envoyée.")
 
-            with db() as con:
+                if duplicate_match:
+                    raise ValueError("Cette partie a déjà été comptabilisée.")
+
                 con.execute(
                     """INSERT INTO replays
                     (user_id,filename,stored_name,sha256,match_id,chests,status,note,uploaded_at)
                     VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
-                        user_id, item["filename"], item["stored_name"],
-                        item["sha256"], result["match_id"],
-                        result["chests"], "analyzed", "", now_iso()
+                        user_id, item["filename"],
+                        item["stored_name"], item["sha256"],
+                        result["match_id"], result["chests"],
+                        "analyzed", "", now_iso()
                     )
                 )
 
-            result_item.update({
-                "ok": True,
-                "chests": result["chests"],
-                "match_date": result["match_date"]
-            })
+        result_item.update({
+            "ok": True,
+            "chests": result["chests"],
+            "match_date": result["match_date"]
+        })
 
-        except (ValueError, sqlite3.IntegrityError) as exc:
-            result_item["error"] = str(exc)
-        except Exception as exc:
-            result_item["error"] = f"Erreur d'analyse : {type(exc).__name__}"
-        finally:
-            path.unlink(missing_ok=True)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        result_item["error"] = str(exc)
 
-            job["results"].append(result_item)
-            job["completed"] += 1
-            job["percent"] = round(
-                job["completed"] / job["total"] * 100
+    except Exception as exc:
+        result_item["error"] = f"Erreur d'analyse : {type(exc).__name__}"
+
+    finally:
+        path.unlink(missing_ok=True)
+
+    return result_item
+
+
+def process_replay_batch(job_id, user_id, pseudo, files):
+    job = replay_jobs[job_id]
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(process_one_replay, item, user_id, pseudo)
+            for item in files
+        ]
+
+        for future in as_completed(futures):
+    result_item = future.result()
+
+    with replay_db_lock:
+        job["results"].append(result_item)
+        job["completed"] += 1
+        job["percent"] = round(
+            job["completed"] / job["total"] * 100
+        )
             )
 
     job["finished"] = True
     job["percent"] = 100
-    job["accepted"] = sum(1 for r in job["results"] if r["ok"])
+    job["accepted"] = sum(
+        1 for r in job["results"] if r["ok"]
+    )
     job["rejected"] = job["total"] - job["accepted"]
+
 
 
 @app.post("/api/replays")
