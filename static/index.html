@@ -21,7 +21,20 @@ main{max-width:1200px;margin:auto;padding:14px 22px 60px}.hero{border:1px solid 
 <div class="layout">
 <section class="panel"><div class="section-head"><h3>🏆 Classement mondial</h3><span class="tag">TOTAL CUMULÉ</span></div><p class="sub">Trié automatiquement du plus grand au plus petit nombre de coffres.</p><div class="table-wrap"><table><thead><tr><th>#</th><th>Joueur</th><th>Parties</th><th>Coffres</th></tr></thead><tbody id="leaderRows"><tr><td colspan="4" class="muted">Chargement…</td></tr></tbody></table></div><div class="hint">Le classement représente les joueurs et les rediffusions enregistrés sur ce site, pas tous les joueurs Fortnite.</div></section>
 <div style="display:grid;gap:16px">
-<section class="panel" id="accountPanel"><h3>👤 Mon espace joueur</h3><p class="sub">Crée ton compte avec ton pseudo Epic pour importer uniquement tes propres rediffusions.</p><div id="loggedOut"><button block onclick="showAuth()">Créer mon compte / me connecter</button><div class="hint">Chaque compte ne peut voir et gérer que ses propres imports.</div></div><div id="loggedIn" class="hidden"><div class="notice good">Connecté en tant que <b id="myPseudo"></b></div><div class="field"><label>TA REDIFFUSION FORTNITE (.replay)</label><input id="replayFile" type="file" accept=".replay" multiple></div><button id="uploadBtn" onclick="uploadReplay()">Analyser et ajouter les rediffusions</button><div id="uploadNotice" class="notice hidden"></div><div id="batchResults" class="admin-list" style="margin-top:10px"></div><h3 style="font-size:14px;margin-top:18px">Mes rediffusions</h3><div id="myReplayList" class="hint">Aucune rediffusion pour le moment.</div></div></section>
+<section class="panel" id="accountPanel"><h3>👤 Mon espace joueur</h3><p class="sub">Crée ton compte avec ton pseudo Epic pour importer uniquement tes propres rediffusions.</p><div id="loggedOut"><button block onclick="showAuth()">Créer mon compte / me connecter</button><div class="hint">Chaque compte ne peut voir et gérer que ses propres imports.</div></div><div id="loggedIn" class="hidden"><div class="notice good">Connecté en tant que <b id="myPseudo"></b></div><div class="field"><label>TA REDIFFUSION FORTNITE (.replay)</label><input id="replayFile" type="file" accept=".replay" multiple></div><button id="uploadBtn" onclick="uploadReplay()">Analyser et ajouter les rediffusions</button><div id="uploadNotice" class="notice hidden"></div><div id="uploadNotice" class="notice hidden"></div>
+
+<div id="progressArea" class="hidden" style="margin:15px 0">
+  <div style="display:flex;justify-content:space-between;margin-bottom:7px">
+    <b>Progression de l'analyse</b>
+    <b id="progressPercent">0 %</b>
+  </div>
+  <div style="height:13px;background:#263b58;border-radius:20px;overflow:hidden">
+    <div id="progressBar" style="height:100%;width:0%;background:linear-gradient(90deg,#43a7ff,#54d6a0);border-radius:20px;transition:width .3s"></div>
+  </div>
+  <div id="progressText" class="hint">0 / 0 rediffusions analysées</div>
+</div>
+
+<div id="batchResults" class="admin-list" style="margin-top:10px"></div><div id="batchResults" class="admin-list" style="margin-top:10px"></div><h3 style="font-size:14px;margin-top:18px">Mes rediffusions</h3><div id="myReplayList" class="hint">Aucune rediffusion pour le moment.</div></div></section>
 <section class="panel hidden" id="adminPanel"><div class="section-head"><h3>🛡️ Administration</h3><span class="tag">ADMIN</span></div><p class="sub">Gestion globale des comptes et rediffusions.</p><div class="section-head"><b>Rediffusions envoyées</b><button class="secondary small" onclick="loadAdmin()">Actualiser</button></div><div id="adminReplayList" class="admin-list" style="margin-top:10px"></div><div class="section-head" style="margin-top:18px"><b>Comptes joueurs</b></div><div id="adminUserList" class="admin-list" style="margin-top:10px"></div></section>
 </div></div>
 <div class="footer">FORTNITE CHEST AI • Statistiques calculées à partir des rediffusions importées • Non affilié à Epic Games.</div>
