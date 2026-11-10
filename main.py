@@ -1,7 +1,8 @@
 import os, re, json, time, hmac, hashlib, secrets, sqlite3, subprocess, shlex
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 from typing import Optional
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -180,7 +181,21 @@ def analyze_replay(path: Path, expected_pseudo: str):
         match_id = str(result.get("match_id", "")).strip()
         if not match_id:
             return None, "L'analyseur n'a pas fourni d'identifiant de partie."
-        return {"chests": count, "match_id": match_id}, ""
+        # La date de début est fournie par ChestCounter en UTC.
+        # On applique la date limite selon le calendrier français (Europe/Paris).
+        raw_match_start = result.get("match_start_utc")
+        if not raw_match_start:
+            return None, "Date du match introuvable : rediffusion refusée par sécurité."
+        try:
+            match_start = datetime.fromisoformat(str(raw_match_start).replace("Z", "+00:00"))
+            if match_start.tzinfo is None:
+                match_start = match_start.replace(tzinfo=timezone.utc)
+            match_date_fr = match_start.astimezone(ZoneInfo("Europe/Paris")).date()
+        except (TypeError, ValueError, OverflowError):
+            return None, "Date du match invalide : rediffusion refusée."
+        if match_date_fr < date(2026, 11, 1):
+            return None, "Rediffusion refusée : seules les parties jouées à partir du 01/11/2026 sont acceptées."
+        return {"chests": count, "match_id": match_id, "match_date": match_date_fr.isoformat()}, ""
     except subprocess.TimeoutExpired:
         return None, "L'analyse de la rediffusion a dépassé le délai autorisé."
     except Exception as exc:
@@ -295,40 +310,105 @@ def my_replays(request: Request):
     return {"replays": [dict(r) for r in rows]}
 
 @app.post("/api/replays")
-async def upload_replay(request: Request, replay: UploadFile = File(...)):
+async def upload_replay(request: Request, replay: list[UploadFile] = File(...)):
+    """
+    Accepte plusieurs fichiers dans une seule requête.
+    Chaque fichier est traité indépendamment : une erreur n'empêche pas
+    les autres rediffusions valides d'être ajoutées.
+    """
     s = require_user(request)
-    filename = safe_name(replay.filename)
-    if not filename.lower().endswith(".replay"):
-        raise HTTPException(400, "Importe un fichier .replay.")
-    content = await replay.read(MAX_UPLOAD + 1)
-    if len(content) > MAX_UPLOAD:
-        raise HTTPException(413, "Fichier trop volumineux (100 Mo maximum).")
-    if len(content) < 64 or content[:4] != bytes.fromhex("7fe2a21c"):
-        raise HTTPException(400, "Ce fichier ne ressemble pas à une rediffusion Fortnite valide.")
-    digest = hashlib.sha256(content).hexdigest()
-    with db() as con:
-        duplicate = con.execute("SELECT id FROM replays WHERE sha256=?", (digest,)).fetchone()
-        if duplicate:
-            raise HTTPException(409, "Cette rediffusion a déjà été envoyée. Les doublons sont bloqués.")
-    stored = f"{secrets.token_hex(16)}.replay"
-    path = UPLOAD_DIR / stored
-    path.write_bytes(content)
-    result, note = analyze_replay(path, s["pseudo"])
-    if not result:
-        path.unlink(missing_ok=True)
-        raise HTTPException(422, note or "Cette rediffusion n'a pas pu être analysée.")
-    status, chests, match_id, note = "analyzed", result["chests"], result["match_id"], ""
-    with db() as con:
-        dupe_match = con.execute("SELECT id FROM replays WHERE match_id=? AND status='analyzed'", (match_id,)).fetchone()
-    if dupe_match:
-        path.unlink(missing_ok=True)
-        raise HTTPException(409, "Cette partie a déjà été comptabilisée (identifiant de match déjà connu).")
-    with db() as con:
-        con.execute("""INSERT INTO replays(user_id,filename,stored_name,sha256,match_id,chests,status,note,uploaded_at)
+    if not replay:
+        raise HTTPException(400, "Choisis au moins une rediffusion .replay.")
+    if len(replay) > 10:
+        raise HTTPException(400, "10 rediffusions maximum par envoi.")
+
+    results = []
+    for uploaded in replay:
+        filename = safe_name(uploaded.filename)
+        stored = None
+        path = None
+        try:
+            if not filename.lower().endswith(".replay"):
+                raise HTTPException(400, "Format refusé : importe un fichier .replay.")
+
+            content = await uploaded.read(MAX_UPLOAD + 1)
+            if len(content) > MAX_UPLOAD:
+                raise HTTPException(413, "Fichier trop volumineux (100 Mo maximum).")
+            if len(content) < 64 or content[:4] != bytes.fromhex("7fe2a21c"):
+                raise HTTPException(400, "Ce fichier ne ressemble pas à une rediffusion Fortnite valide.")
+
+            digest = hashlib.sha256(content).hexdigest()
+            with db() as con:
+                duplicate = con.execute("SELECT id FROM replays WHERE sha256=?", (digest,)).fetchone()
+            if duplicate:
+                raise HTTPException(409, "Cette rediffusion a déjà été envoyée.")
+
+            stored = f"{secrets.token_hex(16)}.replay"
+            path = UPLOAD_DIR / stored
+            path.write_bytes(content)
+
+            result, note = analyze_replay(path, s["pseudo"])
+            if not result:
+                raise HTTPException(422, note or "Cette rediffusion n'a pas pu être analysée.")
+
+            with db() as con:
+                dupe_match = con.execute(
+                    "SELECT id FROM replays WHERE match_id=? AND status='analyzed'",
+                    (result["match_id"],)
+                ).fetchone()
+            if dupe_match:
+                raise HTTPException(409, "Cette partie a déjà été comptabilisée.")
+
+            with db() as con:
+                con.execute(
+                    """INSERT INTO replays(user_id,filename,stored_name,sha256,match_id,chests,status,note,uploaded_at)
                        VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (s["user_id"], filename, stored, digest, match_id, chests, status, note, now_iso()))
-    return {"ok": True, "status": status, "chests": chests, "note": note,
-            "message": "Rediffusion analysée et ajoutée au classement."}
+                    (s["user_id"], filename, stored, digest, result["match_id"],
+                     result["chests"], "analyzed", "", now_iso())
+                )
+
+            results.append({
+                "filename": filename,
+                "ok": True,
+                "status": "analyzed",
+                "chests": result["chests"],
+                "match_date": result["match_date"],
+                "message": "Rediffusion analysée et ajoutée au classement."
+            })
+        except HTTPException as exc:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            results.append({
+                "filename": filename,
+                "ok": False,
+                "error": str(exc.detail)
+            })
+        except sqlite3.IntegrityError:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            results.append({
+                "filename": filename,
+                "ok": False,
+                "error": "Cette rediffusion ou cette partie a déjà été enregistrée."
+            })
+        except Exception as exc:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            results.append({
+                "filename": filename,
+                "ok": False,
+                "error": f"Erreur pendant l'analyse ({type(exc).__name__})."
+            })
+        finally:
+            await uploaded.close()
+
+    accepted = sum(1 for item in results if item["ok"])
+    return {
+        "ok": accepted > 0,
+        "accepted": accepted,
+        "rejected": len(results) - accepted,
+        "results": results
+    }
 
 @app.delete("/api/replays/{replay_id}")
 def delete_my_replay(replay_id: int, request: Request):
