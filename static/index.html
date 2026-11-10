@@ -54,24 +54,92 @@ async function register(){try{const f=new FormData();f.append('pseudo',$('regPse
 async function login(){try{const f=new FormData();f.append('pseudo',$('logPseudo').value);f.append('password',$('logPass').value);await api('/api/login',{method:'POST',body:f});hideModals();toast('Connexion réussie.');await refresh()}catch(e){toast(e.message)}}
 async function adminLogin(){try{const f=new FormData();f.append('code',$('adminCode').value);await api('/api/admin/login',{method:'POST',body:f});hideModals();toast('Mode administrateur activé.');await refresh()}catch(e){toast(e.message)}}
 async function logout(){await api('/api/logout',{method:'POST'});me=null;toast('Déconnecté.');await refresh()}
+
 async function uploadReplay(){
  const files=Array.from($('replayFile').files||[]);
- if(!files.length){toast('Choisis au moins une rediffusion .replay.');return}
- if(files.length>100){toast('100 rediffusions maximum par envoi.');return}
- const f=new FormData();files.forEach(file=>f.append('replay',file));
- $('uploadBtn').disabled=true;$('uploadBtn').textContent='Analyse en cours…';
- $('batchResults').innerHTML=files.map(file=>`<div class="admin-item"><span>${esc(file.name)}</span><span class="status">EN ATTENTE</span></div>`).join('');
- $('uploadNotice').classList.remove('hidden');$('uploadNotice').className='notice';$('uploadNotice').textContent=`${files.length} fichier(s) envoyé(s). Analyse en cours…`;
+
+ if(!files.length){
+  toast('Choisis au moins une rediffusion .replay.');
+  return;
+ }
+
+ if(files.length>100){
+  toast('100 rediffusions maximum par envoi.');
+  return;
+ }
+
+ const f=new FormData();
+ files.forEach(file=>f.append('replay',file));
+
+ $('uploadBtn').disabled=true;
+ $('uploadBtn').textContent='Envoi des fichiers…';
+ $('progressArea').classList.remove('hidden');
+ $('progressPercent').textContent='0 %';
+ $('progressBar').style.width='0%';
+ $('progressText').textContent=`0 / ${files.length} rediffusions analysées`;
+ $('batchResults').innerHTML='';
+ $('uploadNotice').className='notice';
+ $('uploadNotice').classList.remove('hidden');
+ $('uploadNotice').textContent='Envoi des fichiers au serveur…';
+
  try{
-  const d=await api('/api/replays',{method:'POST',body:f});
-  $('batchResults').innerHTML=d.results.map(item=>`<div class="admin-item"><div><b>${esc(item.filename)}</b><br><span class="muted">${item.ok?`${item.chests} coffre(s) ajouté(s) • Match du ${new Date(item.match_date+'T12:00:00').toLocaleDateString('fr-FR')}`:esc(item.error)}</span></div><span class="status ${item.ok?'analyzed':''}">${item.ok?'ACCEPTÉ':'REFUSÉ'}</span></div>`).join('');
+  const job=await api('/api/replays',{
+   method:'POST',
+   body:f
+  });
+
+  $('uploadNotice').textContent='Analyse des rediffusions en cours…';
+
+  let finished=false;
+  let d;
+
+  while(!finished){
+   await new Promise(resolve=>setTimeout(resolve,1000));
+
+   d=await api('/api/replays/progress/'+encodeURIComponent(job.job_id));
+
+   $('progressPercent').textContent=d.percent+' %';
+   $('progressBar').style.width=d.percent+'%';
+   $('progressText').textContent=
+    `${d.completed} / ${d.total} rediffusions analysées`;
+
+   $('batchResults').innerHTML=d.results.map(item=>`
+    <div class="admin-item">
+     <div>
+      <b>${esc(item.filename)}</b><br>
+      <span class="muted">
+       ${item.ok
+        ? `${item.chests} coffre(s) ajouté(s) • Match du ${new Date(item.match_date+'T12:00:00').toLocaleDateString('fr-FR')}`
+        : esc(item.error)}
+      </span>
+     </div>
+     <span class="status ${item.ok?'analyzed':''}">
+      ${item.ok?'ACCEPTÉ':'REFUSÉ'}
+     </span>
+    </div>
+   `).join('');
+
+   finished=d.finished;
+  }
+
+  $('progressPercent').textContent='100 %';
+  $('progressBar').style.width='100%';
   $('uploadNotice').className='notice '+(d.accepted>0?'good':'warn');
-  $('uploadNotice').textContent=`Terminé : ${d.accepted} accepté(s), ${d.rejected} refusé(s).`;
-  $('replayFile').value='';await refresh();
+  $('uploadNotice').textContent=
+   `Terminé : ${d.accepted} accepté(s), ${d.rejected} refusé(s).`;
+
+  $('replayFile').value='';
+  await refresh();
+
  }catch(e){
-  $('uploadNotice').className='notice warn';$('uploadNotice').textContent=e.message;
- }finally{$('uploadBtn').disabled=false;$('uploadBtn').textContent='Analyser et ajouter les rediffusions'}
+  $('uploadNotice').className='notice warn';
+  $('uploadNotice').textContent=e.message;
+ }finally{
+  $('uploadBtn').disabled=false;
+  $('uploadBtn').textContent='Analyser et ajouter les rediffusions';
+ }
 }
+
 async function loadMy(){const d=await api('/api/my/replays');$('myReplayList').innerHTML=d.replays.length?d.replays.map(r=>`<div class="my-row"><div><b>${esc(r.filename)}</b><small>${new Date(r.uploaded_at).toLocaleString('fr-FR')} • ${r.status==='analyzed'?r.chests+' coffres':esc(r.note||'En attente')}</small></div><div style="display:flex;gap:7px;align-items:center"><span class="status ${r.status}">${r.status==='analyzed'?'ANALYSÉ':'EN ATTENTE'}</span><button class="danger small" onclick="deleteMine(${r.id})">Supprimer</button></div></div>`).join(''):'<div class="empty">Aucune rediffusion importée.</div>'}
 async function deleteMine(id){if(!confirm('Supprimer cette rediffusion de ton compte ?'))return;try{await api('/api/replays/'+id,{method:'DELETE'});toast('Rediffusion supprimée.');await refresh()}catch(e){toast(e.message)}}
 async function loadAdmin(){if(!me?.admin)return;const [r,u]=await Promise.all([api('/api/admin/replays'),api('/api/admin/users')]);$('adminReplayList').innerHTML=r.replays.length?r.replays.map(x=>`<div class="admin-item"><div><b>${esc(x.pseudo)}</b> — ${esc(x.filename)}<br><span class="muted">${x.status==='analyzed'?x.chests+' coffres':'En attente d’analyse'}</span></div><button class="danger small" onclick="adminDeleteReplay(${x.id})">Supprimer</button></div>`).join(''):'<div class="empty">Aucune rediffusion.</div>';$('adminUserList').innerHTML=u.users.length?u.users.map(x=>`<div class="admin-item"><div><b>${esc(x.pseudo)}</b><br><span class="muted">${x.matches} parties • ${x.chests} coffres</span></div><button class="danger small" onclick="adminDeleteUser(${x.id})">Supprimer compte</button></div>`).join(''):'<div class="empty">Aucun compte joueur.</div>'}
