@@ -44,7 +44,7 @@ async function logout(){await api('/api/logout',{method:'POST'});me=null;toast('
 async function uploadReplay(){
  const files=Array.from($('replayFile').files||[]);
  if(!files.length){toast('Choisis au moins une rediffusion .replay.');return}
- if(files.length>10){toast('100 rediffusions maximum par envoi.');return}
+ if(files.length>100){toast('100 rediffusions maximum par envoi.');return}
  const f=new FormData();files.forEach(file=>f.append('replay',file));
  $('uploadBtn').disabled=true;$('uploadBtn').textContent='Analyse en cours…';
  $('batchResults').innerHTML=files.map(file=>`<div class="admin-item"><span>${esc(file.name)}</span><span class="status">EN ATTENTE</span></div>`).join('');
