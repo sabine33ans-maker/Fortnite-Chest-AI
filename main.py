@@ -1,0 +1,386 @@
+import os, re, json, time, hmac, hashlib, secrets, sqlite3, subprocess, shlex
+from contextlib import contextmanager
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
+UPLOAD_DIR = DATA_DIR / "uploads"
+DB_PATH = DATA_DIR / "chest_ai.sqlite3"
+MAX_UPLOAD = 100 * 1024 * 1024
+ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "CHANGE-ME-BEFORE-PUBLISH-" + secrets.token_hex(24))
+ANALYZER_COMMAND = os.environ.get("CHEST_ANALYZER_COMMAND", "dotnet /app/analyzer/ChestReplayCli.dll").strip()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Fortnite Chest AI")
+app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+def init_db():
+    with db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pseudo TEXT NOT NULL COLLATE NOCASE UNIQUE,
+          password_hash TEXT NOT NULL,
+          salt TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          legacy_chests INTEGER NOT NULL DEFAULT 0,
+          legacy_matches INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id INTEGER,
+          role TEXT NOT NULL,
+          expires_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS replays (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          filename TEXT NOT NULL,
+          stored_name TEXT NOT NULL,
+          sha256 TEXT NOT NULL UNIQUE,
+          match_id TEXT,
+          chests INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'pending',
+          note TEXT NOT NULL DEFAULT '',
+          uploaded_at TEXT NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS legacy_profiles (
+          pseudo TEXT PRIMARY KEY COLLATE NOCASE,
+          chests INTEGER NOT NULL,
+          matches INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS admin_login_attempts (
+          ip TEXT NOT NULL,
+          attempted_at INTEGER NOT NULL
+        );
+        """)
+        # Migrate databases created by the first public-site package.
+        columns = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
+        if "legacy_chests" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN legacy_chests INTEGER NOT NULL DEFAULT 0")
+        if "legacy_matches" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN legacy_matches INTEGER NOT NULL DEFAULT 0")
+        # Keep the original 121-chest profile unless its owner has claimed that pseudo.
+        con.execute(
+            """INSERT OR IGNORE INTO legacy_profiles(pseudo,chests,matches)
+               SELECT ?,?,? WHERE NOT EXISTS
+               (SELECT 1 FROM users WHERE pseudo=? COLLATE NOCASE)""",
+            ("Siko aura kingǃ", 121, 12, "Siko aura kingǃ")
+        )
+
+init_db()
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def hash_password(password: str, salt: Optional[str] = None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 240_000).hex()
+    return digest, salt
+
+def new_session(user_id=None, role="viewer"):
+    token = secrets.token_urlsafe(40)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires = int(time.time()) + 60 * 60 * 24 * 30
+    with db() as con:
+        con.execute("INSERT INTO sessions(token_hash,user_id,role,expires_at) VALUES(?,?,?,?)",
+                    (token_hash, user_id, role, expires))
+    return token
+
+def get_session(request: Request):
+    token = request.cookies.get("chest_session")
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with db() as con:
+        row = con.execute("""
+            SELECT s.*, u.pseudo FROM sessions s
+            LEFT JOIN users u ON u.id=s.user_id
+            WHERE s.token_hash=? AND s.expires_at>?
+        """, (token_hash, int(time.time()))).fetchone()
+    return dict(row) if row else None
+
+def require_user(request: Request):
+    s = get_session(request)
+    if not s or s["role"] != "viewer" or not s["user_id"]:
+        raise HTTPException(401, "Connecte-toi à ton compte.")
+    return s
+
+def require_admin(request: Request):
+    s = get_session(request)
+    if not s or s["role"] != "admin":
+        raise HTTPException(403, "Accès administrateur requis.")
+    return s
+
+def safe_name(name):
+    name = Path(name or "rediffusion.replay").name
+    return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "rediffusion.replay"
+
+def analyze_replay(path: Path, expected_pseudo: str):
+    """
+    Runs the bundled LED-N ChestCounter parser through the small .NET CLI adapter.
+    The adapter receives the replay path and expected Epic display name, then emits
+    a machine-readable JSON result. A result is accepted only for an exact player match.
+    """
+    if not ANALYZER_COMMAND:
+        return None, "Analyseur .replay non configuré sur le serveur. Fichier mis en attente, aucun coffre ajouté."
+    try:
+        command = shlex.split(ANALYZER_COMMAND, posix=(os.name != "nt"))
+        if not command:
+            return None, "Commande de l'analyseur vide."
+        proc = subprocess.run(
+            [*command, str(path), expected_pseudo],
+            capture_output=True, text=True, timeout=240, check=False
+        )
+        output_lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if output_lines:
+            try:
+                result = json.loads(output_lines[-1])
+            except json.JSONDecodeError:
+                result = None
+            if isinstance(result, dict) and result.get("ok") is False:
+                return None, str(result.get("error", "Rediffusion non analysable"))[:500]
+        else:
+            result = None
+        if proc.returncode != 0:
+            return None, (proc.stderr or "Échec du décodeur")[-500:]
+        if not isinstance(result, dict):
+            return None, "Le décodeur n'a pas renvoyé de résultat valide." 
+        player = str(result.get("player_name", "")).strip()
+        if player.casefold() != expected_pseudo.casefold():
+            return None, "Le joueur enregistré dans la rediffusion ne correspond pas à ton pseudo."
+        count = int(result.get("chests_opened", -1))
+        if count < 0 or count > 500:
+            return None, "Nombre de coffres invalide renvoyé par l'analyseur."
+        match_id = str(result.get("match_id", "")).strip()
+        if not match_id:
+            return None, "L'analyseur n'a pas fourni d'identifiant de partie."
+        return {"chests": count, "match_id": match_id}, ""
+    except subprocess.TimeoutExpired:
+        return None, "L'analyse de la rediffusion a dépassé le délai autorisé."
+    except Exception as exc:
+        return None, f"Analyse impossible : {type(exc).__name__}"
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+@app.get("/api/me")
+def me(request: Request):
+    s = get_session(request)
+    if not s:
+        return {"logged_in": False, "admin": False}
+    return {"logged_in": True, "admin": s["role"] == "admin",
+            "pseudo": s.get("pseudo") or "Admin", "role": s["role"]}
+
+@app.post("/api/register")
+def register(pseudo: str = Form(...), password: str = Form(...)):
+    pseudo = pseudo.strip()
+    if not 2 <= len(pseudo) <= 32 or any(ord(ch) < 32 for ch in pseudo):
+        raise HTTPException(400, "Pseudo invalide (2 à 32 caractères, sans caractères de contrôle).")
+    if len(password) < 8:
+        raise HTTPException(400, "Mot de passe : 8 caractères minimum.")
+    with db() as con:
+        if con.execute("SELECT 1 FROM users WHERE pseudo=? COLLATE NOCASE", (pseudo,)).fetchone():
+            raise HTTPException(409, "Ce pseudo est déjà utilisé.")
+        legacy = con.execute("SELECT chests,matches FROM legacy_profiles WHERE pseudo=? COLLATE NOCASE",
+                             (pseudo,)).fetchone()
+        pw_hash, salt = hash_password(password)
+        cur = con.execute("""INSERT INTO users(pseudo,password_hash,salt,created_at,legacy_chests,legacy_matches)
+                             VALUES(?,?,?,?,?,?)""",
+                          (pseudo, pw_hash, salt, now_iso(),
+                           legacy["chests"] if legacy else 0, legacy["matches"] if legacy else 0))
+        uid = cur.lastrowid
+        if legacy:
+            con.execute("DELETE FROM legacy_profiles WHERE pseudo=? COLLATE NOCASE", (pseudo,))
+    token = new_session(uid, "viewer")
+    response = JSONResponse({"ok": True, "pseudo": pseudo})
+    response.set_cookie("chest_session", token, httponly=True, secure=os.environ.get("COOKIE_SECURE","0") == "1",
+                        samesite="lax", max_age=60*60*24*30, path="/")
+    return response
+
+@app.post("/api/login")
+def login(pseudo: str = Form(...), password: str = Form(...)):
+    with db() as con:
+        row = con.execute("SELECT * FROM users WHERE pseudo=? COLLATE NOCASE", (pseudo.strip(),)).fetchone()
+    if not row:
+        raise HTTPException(401, "Pseudo ou mot de passe incorrect.")
+    candidate, _ = hash_password(password, row["salt"])
+    if not hmac.compare_digest(candidate, row["password_hash"]):
+        raise HTTPException(401, "Pseudo ou mot de passe incorrect.")
+    token = new_session(row["id"], "viewer")
+    response = JSONResponse({"ok": True, "pseudo": row["pseudo"]})
+    response.set_cookie("chest_session", token, httponly=True, secure=os.environ.get("COOKIE_SECURE","0") == "1",
+                        samesite="lax", max_age=60*60*24*30, path="/")
+    return response
+
+@app.post("/api/admin/login")
+def admin_login(request: Request, code: str = Form(...)):
+    ip = request.client.host if request.client else "unknown"
+    cutoff = int(time.time()) - 15 * 60
+    with db() as con:
+        con.execute("DELETE FROM admin_login_attempts WHERE attempted_at<?", (cutoff,))
+        attempts = con.execute("SELECT COUNT(*) FROM admin_login_attempts WHERE ip=?", (ip,)).fetchone()[0]
+    if attempts >= 5:
+        raise HTTPException(429, "Trop de tentatives. Réessaie dans 15 minutes.")
+    if not ADMIN_CODE or not hmac.compare_digest(code, ADMIN_CODE):
+        with db() as con:
+            con.execute("INSERT INTO admin_login_attempts(ip,attempted_at) VALUES(?,?)", (ip, int(time.time())))
+        raise HTTPException(401, "Code admin incorrect.")
+    with db() as con:
+        con.execute("DELETE FROM admin_login_attempts WHERE ip=?", (ip,))
+    token = new_session(None, "admin")
+    response = JSONResponse({"ok": True})
+    response.set_cookie("chest_session", token, httponly=True, secure=os.environ.get("COOKIE_SECURE","0") == "1",
+                        samesite="lax", max_age=60*60*24*30, path="/")
+    return response
+
+@app.post("/api/logout")
+def logout(request: Request):
+    token = request.cookies.get("chest_session")
+    if token:
+        with db() as con:
+            con.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("chest_session", path="/")
+    return response
+
+@app.get("/api/leaderboard")
+def leaderboard():
+    with db() as con:
+        users = con.execute("""
+            SELECT u.id,u.pseudo,
+                   u.legacy_chests + COALESCE(SUM(CASE WHEN r.status='analyzed' THEN r.chests ELSE 0 END),0) AS chests,
+                   u.legacy_matches + COALESCE(SUM(CASE WHEN r.status='analyzed' THEN 1 ELSE 0 END),0) AS matches
+            FROM users u LEFT JOIN replays r ON r.user_id=u.id
+            GROUP BY u.id,u.pseudo,u.legacy_chests,u.legacy_matches
+        """).fetchall()
+        legacy = con.execute("SELECT pseudo,chests,matches FROM legacy_profiles").fetchall()
+    rows = [{"pseudo": x["pseudo"], "chests": x["chests"], "matches": x["matches"] or 0, "legacy": False} for x in users]
+    rows += [{"pseudo": x["pseudo"], "chests": x["chests"], "matches": x["matches"], "legacy": True} for x in legacy]
+    rows.sort(key=lambda x: (-x["chests"], x["pseudo"].casefold()))
+    return {"players": rows, "total_players": len(rows)}
+
+@app.get("/api/my/replays")
+def my_replays(request: Request):
+    s = require_user(request)
+    with db() as con:
+        rows = con.execute("SELECT id,filename,sha256,chests,status,note,uploaded_at FROM replays WHERE user_id=? ORDER BY id DESC",
+                           (s["user_id"],)).fetchall()
+    return {"replays": [dict(r) for r in rows]}
+
+@app.post("/api/replays")
+async def upload_replay(request: Request, replay: UploadFile = File(...)):
+    s = require_user(request)
+    filename = safe_name(replay.filename)
+    if not filename.lower().endswith(".replay"):
+        raise HTTPException(400, "Importe un fichier .replay.")
+    content = await replay.read(MAX_UPLOAD + 1)
+    if len(content) > MAX_UPLOAD:
+        raise HTTPException(413, "Fichier trop volumineux (100 Mo maximum).")
+    if len(content) < 64 or content[:4] != bytes.fromhex("7fe2a21c"):
+        raise HTTPException(400, "Ce fichier ne ressemble pas à une rediffusion Fortnite valide.")
+    digest = hashlib.sha256(content).hexdigest()
+    with db() as con:
+        duplicate = con.execute("SELECT id FROM replays WHERE sha256=?", (digest,)).fetchone()
+        if duplicate:
+            raise HTTPException(409, "Cette rediffusion a déjà été envoyée. Les doublons sont bloqués.")
+    stored = f"{secrets.token_hex(16)}.replay"
+    path = UPLOAD_DIR / stored
+    path.write_bytes(content)
+    result, note = analyze_replay(path, s["pseudo"])
+    if not result:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, note or "Cette rediffusion n'a pas pu être analysée.")
+    status, chests, match_id, note = "analyzed", result["chests"], result["match_id"], ""
+    with db() as con:
+        dupe_match = con.execute("SELECT id FROM replays WHERE match_id=? AND status='analyzed'", (match_id,)).fetchone()
+    if dupe_match:
+        path.unlink(missing_ok=True)
+        raise HTTPException(409, "Cette partie a déjà été comptabilisée (identifiant de match déjà connu).")
+    with db() as con:
+        con.execute("""INSERT INTO replays(user_id,filename,stored_name,sha256,match_id,chests,status,note,uploaded_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (s["user_id"], filename, stored, digest, match_id, chests, status, note, now_iso()))
+    return {"ok": True, "status": status, "chests": chests, "note": note,
+            "message": "Rediffusion analysée et ajoutée au classement."}
+
+@app.delete("/api/replays/{replay_id}")
+def delete_my_replay(replay_id: int, request: Request):
+    s = require_user(request)
+    with db() as con:
+        row = con.execute("SELECT stored_name FROM replays WHERE id=? AND user_id=?", (replay_id, s["user_id"])).fetchone()
+        if not row:
+            raise HTTPException(404, "Rediffusion introuvable dans ton compte.")
+        con.execute("DELETE FROM replays WHERE id=? AND user_id=?", (replay_id, s["user_id"]))
+    (UPLOAD_DIR / row["stored_name"]).unlink(missing_ok=True)
+    return {"ok": True}
+
+@app.get("/api/admin/replays")
+def admin_replays(request: Request):
+    require_admin(request)
+    with db() as con:
+        rows = con.execute("""SELECT r.id,r.filename,r.sha256,r.chests,r.status,r.note,r.uploaded_at,u.pseudo
+                              FROM replays r JOIN users u ON u.id=r.user_id ORDER BY r.id DESC LIMIT 500""").fetchall()
+    return {"replays": [dict(r) for r in rows]}
+
+@app.delete("/api/admin/replays/{replay_id}")
+def admin_delete_replay(replay_id: int, request: Request):
+    require_admin(request)
+    with db() as con:
+        row = con.execute("SELECT stored_name FROM replays WHERE id=?", (replay_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Rediffusion introuvable.")
+        con.execute("DELETE FROM replays WHERE id=?", (replay_id,))
+    (UPLOAD_DIR / row["stored_name"]).unlink(missing_ok=True)
+    return {"ok": True}
+
+@app.get("/api/admin/users")
+def admin_users(request: Request):
+    require_admin(request)
+    with db() as con:
+        rows = con.execute("""SELECT u.id,u.pseudo,u.created_at,
+            u.legacy_matches + COUNT(CASE WHEN r.status='analyzed' THEN 1 END) AS matches,
+            u.legacy_chests + COALESCE(SUM(CASE WHEN r.status='analyzed' THEN r.chests ELSE 0 END),0) AS chests
+            FROM users u LEFT JOIN replays r ON r.user_id=u.id
+            GROUP BY u.id,u.legacy_matches,u.legacy_chests ORDER BY u.pseudo""").fetchall()
+    return {"users": [dict(r) for r in rows]}
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, request: Request):
+    require_admin(request)
+    with db() as con:
+        rows = con.execute("SELECT stored_name FROM replays WHERE user_id=?", (user_id,)).fetchall()
+        con.execute("DELETE FROM users WHERE id=?", (user_id,))
+    for row in rows:
+        (UPLOAD_DIR / row["stored_name"]).unlink(missing_ok=True)
+    return {"ok": True}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "analyzer_configured": bool(ANALYZER_COMMAND)}

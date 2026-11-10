@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>ChestCounter.Core</AssemblyName>
+    <RootNamespace>ChestCounter</RootNamespace>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../src/ChestCounter/**/*.cs"
+             Exclude="../src/ChestCounter/Program.cs;../src/ChestCounter/bin/**;../src/ChestCounter/obj/**" />
+    <ProjectReference Include="../lib/FortniteReplayReader/FortniteReplayReader.csproj" />
+  </ItemGroup>
+</Project>

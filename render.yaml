@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: fortnite-chest-ai
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: ADMIN_CODE
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: chest-ai-data
+      mountPath: /data
+      sizeGB: 1
