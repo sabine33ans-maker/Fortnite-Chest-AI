@@ -390,6 +390,87 @@ def process_one_replay(item, user_id, pseudo):
     return result_item
 
 
+
+def process_one_replay(item, user_id, pseudo):
+    result_item = {
+        "filename": item["filename"],
+        "ok": False,
+        "error": ""
+    }
+    path = Path(item["path"])
+
+    try:
+        if item.get("error"):
+            raise ValueError(item["error"])
+
+        with replay_db_lock:
+            with db() as con:
+                duplicate = con.execute(
+                    "SELECT id FROM replays WHERE sha256=?",
+                    (item["sha256"],)
+                ).fetchone()
+
+        if duplicate:
+            raise ValueError("Cette rediffusion a déjà été envoyée.")
+
+        result, note = analyze_replay(path, pseudo)
+
+        if not result:
+            raise ValueError(note or "Rediffusion non analysable.")
+
+        with replay_db_lock:
+            with db() as con:
+                duplicate = con.execute(
+                    "SELECT id FROM replays WHERE sha256=?",
+                    (item["sha256"],)
+                ).fetchone()
+
+                duplicate_match = con.execute(
+                    "SELECT id FROM replays WHERE match_id=? AND status='analyzed'",
+                    (result["match_id"],)
+                ).fetchone()
+
+                if duplicate:
+                    raise ValueError("Cette rediffusion a déjà été envoyée.")
+
+                if duplicate_match:
+                    raise ValueError("Cette partie a déjà été comptabilisée.")
+
+                con.execute(
+                    """INSERT INTO replays
+                    (user_id,filename,stored_name,sha256,match_id,chests,status,note,uploaded_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        user_id,
+                        item["filename"],
+                        item["stored_name"],
+                        item["sha256"],
+                        result["match_id"],
+                        result["chests"],
+                        "analyzed",
+                        "",
+                        now_iso()
+                    )
+                )
+
+        result_item.update({
+            "ok": True,
+            "chests": result["chests"],
+            "match_date": result["match_date"]
+        })
+
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        result_item["error"] = str(exc)
+
+    except Exception as exc:
+        result_item["error"] = f"Erreur d'analyse : {type(exc).__name__}"
+
+    finally:
+        path.unlink(missing_ok=True)
+
+    return result_item
+
+
 def process_replay_batch(job_id, user_id, pseudo, files):
     job = replay_jobs[job_id]
 
@@ -400,15 +481,14 @@ def process_replay_batch(job_id, user_id, pseudo, files):
         ]
 
         for future in as_completed(futures):
-    result_item = future.result()
+            result_item = future.result()
 
-    with replay_db_lock:
-        job["results"].append(result_item)
-        job["completed"] += 1
-        job["percent"] = round(
-            job["completed"] / job["total"] * 100
-        )
-            )
+            with replay_db_lock:
+                job["results"].append(result_item)
+                job["completed"] += 1
+                job["percent"] = round(
+                    job["completed"] / job["total"] * 100
+                )
 
     job["finished"] = True
     job["percent"] = 100
@@ -416,6 +496,7 @@ def process_replay_batch(job_id, user_id, pseudo, files):
         1 for r in job["results"] if r["ok"]
     )
     job["rejected"] = job["total"] - job["accepted"]
+
 
 
 
