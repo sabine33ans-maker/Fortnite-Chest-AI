@@ -319,8 +319,8 @@ async def upload_replay(request: Request, replay: list[UploadFile] = File(...)):
     s = require_user(request)
     if not replay:
         raise HTTPException(400, "Choisis au moins une rediffusion .replay.")
-    if len(replay) > 10:
-        raise HTTPException(400, "10 rediffusions maximum par envoi.")
+    if len(replay) > 100:
+        raise HTTPException(400, "100 rediffusions maximum par envoi.")
 
     results = []
     for uploaded in replay:
