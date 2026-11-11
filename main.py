@@ -466,7 +466,18 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         req = urllib.request.Request("https://discord.com/api/users/@me", headers={"Authorization": "Bearer " + token_data["access_token"]})
         with urllib.request.urlopen(req, timeout=15) as r:
             profile = json.loads(r.read().decode())
-    except Exception:
+    except Exception as exc:
+        # Log the upstream failure on Render without exposing OAuth codes or tokens.
+        print(
+            f"Discord OAuth callback failed: {type(exc).__name__}: {str(exc)[:300]}",
+            flush=True
+        )
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                upstream_detail = exc.read().decode("utf-8", errors="replace")[:500]
+                print(f"Discord upstream response: {upstream_detail}", flush=True)
+            except Exception:
+                pass
         raise HTTPException(502, "Discord n'a pas pu confirmer ton compte.")
     discord_id = str(profile.get("id", ""))
     if not discord_id:
