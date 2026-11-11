@@ -142,6 +142,57 @@ def init_db():
 init_db()
 
 
+# Sauvegardes SQLite automatiques : les profils, comptes, coffres et parties
+# sont copiés sans interrompre les lectures/écritures du site.
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_INTERVAL_SECONDS = 6 * 60 * 60
+BACKUP_KEEP_COUNT = 14
+
+
+def create_database_backup():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    destination = BACKUP_DIR / f"chest_ai_{stamp}.sqlite3"
+    temporary = BACKUP_DIR / f".{destination.name}.tmp"
+
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as source:
+            with sqlite3.connect(temporary) as target:
+                source.backup(target)
+                target.execute("PRAGMA integrity_check")
+        os.replace(temporary, destination)
+
+        backups = sorted(
+            BACKUP_DIR.glob("chest_ai_*.sqlite3"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True
+        )
+        for obsolete in backups[BACKUP_KEEP_COUNT:]:
+            obsolete.unlink(missing_ok=True)
+
+        print(f"SQLite backup created: {destination.name}", flush=True)
+        return destination
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        print(f"SQLite backup failed: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+        return None
+
+
+def automatic_backup_worker():
+    while True:
+        time.sleep(BACKUP_INTERVAL_SECONDS)
+        create_database_backup()
+
+
+# Une copie au démarrage, puis une copie toutes les 6 heures.
+create_database_backup()
+threading.Thread(
+    target=automatic_backup_worker,
+    name="sqlite-auto-backup",
+    daemon=True
+).start()
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
