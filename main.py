@@ -349,15 +349,16 @@ def register(pseudo: str = Form(...), password: str = Form(...)):
 
         cur = con.execute(
             """INSERT INTO users
-            (pseudo,password_hash,salt,created_at,legacy_chests,legacy_matches)
-            VALUES(?,?,?,?,?,?)""",
+            (pseudo,password_hash,salt,created_at,legacy_chests,legacy_matches,epic_username)
+            VALUES(?,?,?,?,?,?,?)""",
             (
                 pseudo,
                 pw_hash,
                 salt,
                 now_iso(),
                 legacy["chests"] if legacy else 0,
-                legacy["matches"] if legacy else 0
+                legacy["matches"] if legacy else 0,
+                pseudo
             )
         )
 
