@@ -33,6 +33,11 @@ app = FastAPI(title="Fortnite Chest AI")
 replay_jobs = {}
 replay_db_lock = threading.Lock()
 
+# One shared pool for the whole server: 10 users cannot each start 10 analyzers.
+# This caps concurrent .NET replay processes globally instead of per upload batch.
+REPLAY_WORKERS = max(1, min(10, int(os.environ.get("REPLAY_WORKERS", "10"))))
+replay_executor = ThreadPoolExecutor(max_workers=REPLAY_WORKERS)
+
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
@@ -688,15 +693,22 @@ def process_one_replay(item, user_id, pseudo):
 
 def process_replay_batch(job_id, user_id, pseudo, files):
     job = replay_jobs[job_id]
+    futures = {
+        replay_executor.submit(process_one_replay, item, user_id, pseudo): item
+        for item in files
+    }
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [
-            executor.submit(process_one_replay, item, user_id, pseudo)
-            for item in files
-        ]
-
+    try:
         for future in as_completed(futures):
-            result_item = future.result()
+            item = futures[future]
+            try:
+                result_item = future.result()
+            except Exception as exc:
+                result_item = {
+                    "filename": item.get("filename", "rediffusion.replay"),
+                    "ok": False,
+                    "error": f"Erreur interne d'analyse : {type(exc).__name__}"
+                }
 
             with replay_db_lock:
                 job["results"].append(result_item)
@@ -705,12 +717,14 @@ def process_replay_batch(job_id, user_id, pseudo, files):
                     job["completed"] / job["total"] * 100
                 )
 
-    job["finished"] = True
-    job["percent"] = 100
-    job["accepted"] = sum(
-        1 for r in job["results"] if r["ok"]
-    )
-    job["rejected"] = job["total"] - job["accepted"]
+    finally:
+        with replay_db_lock:
+            job["finished"] = True
+            job["percent"] = 100
+            job["accepted"] = sum(
+                1 for r in job["results"] if r.get("ok")
+            )
+            job["rejected"] = job["total"] - job["accepted"]
 
 
 @app.post("/api/replays")
