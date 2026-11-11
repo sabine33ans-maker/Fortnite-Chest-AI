@@ -459,17 +459,33 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
     if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI):
         raise HTTPException(503, "Connexion Discord non configurée sur Render.")
     body = urllib.parse.urlencode({"client_id": DISCORD_CLIENT_ID, "client_secret": DISCORD_CLIENT_SECRET, "grant_type": "authorization_code", "code": code, "redirect_uri": DISCORD_REDIRECT_URI}).encode()
-    req = urllib.request.Request("https://discord.com/api/oauth2/token", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    user_agent = "DiscordBot (https://github.com/sabine33ans-maker/Fortnite-Chest-AI, 1.0)"
+    stage = "token"
+    req = urllib.request.Request(
+        "https://discord.com/api/v10/oauth2/token",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": user_agent,
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             token_data = json.loads(r.read().decode())
-        req = urllib.request.Request("https://discord.com/api/users/@me", headers={"Authorization": "Bearer " + token_data["access_token"]})
+        stage = "profile"
+        req = urllib.request.Request(
+            "https://discord.com/api/v10/users/@me",
+            headers={
+                "Authorization": "Bearer " + token_data["access_token"],
+                "User-Agent": user_agent,
+            },
+        )
         with urllib.request.urlopen(req, timeout=15) as r:
             profile = json.loads(r.read().decode())
     except Exception as exc:
-        # Log the upstream failure on Render without exposing OAuth codes or tokens.
+        # Never log OAuth codes, client secrets, or access tokens.
         print(
-            f"Discord OAuth callback failed: {type(exc).__name__}: {str(exc)[:300]}",
+            f"Discord OAuth {stage} request failed: {type(exc).__name__}: {str(exc)[:300]}",
             flush=True
         )
         if isinstance(exc, urllib.error.HTTPError):
