@@ -9,7 +9,7 @@ RUN dotnet publish analyzer/ChestReplayCli.csproj -c Release -o /out
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && apt-get install -y --no-install-recommends python3 python3-pip tzdata \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt
