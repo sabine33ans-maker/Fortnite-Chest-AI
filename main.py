@@ -33,9 +33,9 @@ app = FastAPI(title="Fortnite Chest AI")
 replay_jobs = {}
 replay_db_lock = threading.Lock()
 
-# One shared pool for the whole server: 10 users cannot each start 10 analyzers.
-# This caps concurrent .NET replay processes globally instead of per upload batch.
-REPLAY_WORKERS = max(1, min(10, int(os.environ.get("REPLAY_WORKERS", "10"))))
+# One shared pool for the whole server: users share a small, bounded analyzer queue.
+# Keep the default conservative for the Render Starter instance; can be tuned via env.
+REPLAY_WORKERS = max(1, min(4, int(os.environ.get("REPLAY_WORKERS", "3"))))
 replay_executor = ThreadPoolExecutor(max_workers=REPLAY_WORKERS)
 
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
