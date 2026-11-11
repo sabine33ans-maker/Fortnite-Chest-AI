@@ -159,7 +159,9 @@ def create_database_backup():
         with sqlite3.connect(DB_PATH, timeout=30) as source:
             with sqlite3.connect(temporary) as target:
                 source.backup(target)
-                target.execute("PRAGMA integrity_check")
+                integrity = target.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise sqlite3.DatabaseError("Backup integrity check failed")
         os.replace(temporary, destination)
 
         backups = sorted(
