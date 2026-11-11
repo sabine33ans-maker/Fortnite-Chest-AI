@@ -6,11 +6,13 @@ from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import urllib.parse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
@@ -18,6 +20,9 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "chest_ai.sqlite3"
 MAX_UPLOAD = 100 * 1024 * 1024
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "").strip()
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI", "").strip()
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "CHANGE-ME-BEFORE-PUBLISH-" + secrets.token_hex(24))
 ANALYZER_COMMAND = os.environ.get("CHEST_ANALYZER_COMMAND", "dotnet /app/analyzer/ChestReplayCli.dll").strip()
 
@@ -55,6 +60,8 @@ def init_db():
           password_hash TEXT NOT NULL,
           salt TEXT NOT NULL,
           created_at TEXT NOT NULL,
+          discord_id TEXT UNIQUE,
+          epic_username TEXT NOT NULL DEFAULT '',
           legacy_chests INTEGER NOT NULL DEFAULT 0,
           legacy_matches INTEGER NOT NULL DEFAULT 0
         );
@@ -102,6 +109,11 @@ def init_db():
             con.execute(
                 "ALTER TABLE users ADD COLUMN legacy_matches INTEGER NOT NULL DEFAULT 0"
             )
+        if "discord_id" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN discord_id TEXT")
+        if "epic_username" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN epic_username TEXT NOT NULL DEFAULT ''")
+        con.execute("UPDATE users SET epic_username=pseudo WHERE epic_username=''")
 
         con.execute(
             """INSERT OR IGNORE INTO legacy_profiles(pseudo,chests,matches)
@@ -153,7 +165,7 @@ def get_session(request: Request):
 
     with db() as con:
         row = con.execute("""
-            SELECT s.*, u.pseudo FROM sessions s
+            SELECT s.*, u.pseudo, u.epic_username FROM sessions s
             LEFT JOIN users u ON u.id=s.user_id
             WHERE s.token_hash=? AND s.expires_at>?
         """, (token_hash, int(time.time()))).fetchone()
@@ -220,9 +232,11 @@ def analyze_replay(path: Path, expected_pseudo: str):
                 result = None
 
             if isinstance(result, dict) and result.get("ok") is False:
-                return None, str(
-                    result.get("error", "Rediffusion non analysable")
-                )[:500]
+                reason = str(result.get("error", "Rediffusion non analysable"))
+                details = (proc.stderr or "").strip().splitlines()
+                if details:
+                    reason += " — " + details[-1][:200]
+                return None, reason[:500]
         else:
             result = None
 
@@ -301,6 +315,7 @@ def me(request: Request):
         "logged_in": True,
         "admin": s["role"] == "admin",
         "pseudo": s.get("pseudo") or "Admin",
+        "epic_username": s.get("epic_username") or "",
         "role": s["role"]
     }
 
@@ -401,6 +416,77 @@ def login(pseudo: str = Form(...), password: str = Form(...)):
 
     return response
 
+
+
+@app.get("/api/discord/start")
+def discord_start(request: Request):
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI):
+        raise HTTPException(503, "Connexion Discord non configurée sur Render.")
+    state = secrets.token_urlsafe(32)
+    params = urllib.parse.urlencode({"client_id": DISCORD_CLIENT_ID, "redirect_uri": DISCORD_REDIRECT_URI, "response_type": "code", "scope": "identify", "state": state})
+    response = RedirectResponse("https://discord.com/oauth2/authorize?" + params, status_code=302)
+    response.set_cookie("discord_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600, path="/")
+    return response
+
+
+@app.get("/api/discord/callback")
+def discord_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    expected = request.cookies.get("discord_oauth_state", "")
+    if error:
+        return RedirectResponse("/", status_code=303)
+    if not code or not state or not expected or not hmac.compare_digest(state, expected):
+        raise HTTPException(400, "Vérification Discord invalide. Réessaie.")
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI):
+        raise HTTPException(503, "Connexion Discord non configurée sur Render.")
+    body = urllib.parse.urlencode({"client_id": DISCORD_CLIENT_ID, "client_secret": DISCORD_CLIENT_SECRET, "grant_type": "authorization_code", "code": code, "redirect_uri": DISCORD_REDIRECT_URI}).encode()
+    req = urllib.request.Request("https://discord.com/api/oauth2/token", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            token_data = json.loads(r.read().decode())
+        req = urllib.request.Request("https://discord.com/api/users/@me", headers={"Authorization": "Bearer " + token_data["access_token"]})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            profile = json.loads(r.read().decode())
+    except Exception:
+        raise HTTPException(502, "Discord n'a pas pu confirmer ton compte.")
+    discord_id = str(profile.get("id", ""))
+    if not discord_id:
+        raise HTTPException(502, "Identifiant Discord introuvable.")
+    current = get_session(request)
+    with db() as con:
+        found = con.execute("SELECT id FROM users WHERE discord_id=?", (discord_id,)).fetchone()
+        if current and current.get("role") == "viewer" and current.get("user_id"):
+            if found and found["id"] != current["user_id"]:
+                raise HTTPException(409, "Ce compte Discord est déjà lié à un autre compte.")
+            con.execute("UPDATE users SET discord_id=? WHERE id=?", (discord_id, current["user_id"]))
+            uid = current["user_id"]
+        elif found:
+            uid = found["id"]
+        else:
+            raw = str(profile.get("global_name") or profile.get("username") or "Joueur")
+            base = re.sub(r"[^A-Za-z0-9 _.-]", "", raw).strip()[:24] or "Joueur"
+            pseudo, n = base, 2
+            while con.execute("SELECT 1 FROM users WHERE pseudo=? COLLATE NOCASE", (pseudo,)).fetchone():
+                tail = "_" + str(n)
+                pseudo, n = base[:32-len(tail)] + tail, n + 1
+            ph, salt = hash_password(secrets.token_urlsafe(40))
+            cur = con.execute("INSERT INTO users(pseudo,password_hash,salt,created_at,discord_id,epic_username) VALUES(?,?,?,?,?,?)", (pseudo, ph, salt, now_iso(), discord_id, ""))
+            uid = cur.lastrowid
+    token = new_session(uid, "viewer")
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie("discord_oauth_state", path="/")
+    response.set_cookie("chest_session", token, httponly=True, secure=os.environ.get("COOKIE_SECURE", "0") == "1", samesite="lax", max_age=2592000, path="/")
+    return response
+
+
+@app.post("/api/profile/epic")
+def set_epic_username(request: Request, epic_username: str = Form(...)):
+    s = require_user(request)
+    epic_username = epic_username.strip()
+    if not 2 <= len(epic_username) <= 32 or any(ord(c) < 32 for c in epic_username):
+        raise HTTPException(400, "Pseudo Epic invalide (2 à 32 caractères).")
+    with db() as con:
+        con.execute("UPDATE users SET epic_username=? WHERE id=?", (epic_username, s["user_id"]))
+    return {"ok": True, "epic_username": epic_username}
 
 @app.post("/api/admin/login")
 def admin_login(request: Request, code: str = Form(...)):
@@ -639,6 +725,9 @@ async def upload_replay(
     replay: list[UploadFile] = File(...)
 ):
     s = require_user(request)
+    epic_username = (s.get("epic_username") or "").strip()
+    if not epic_username:
+        raise HTTPException(400, "Enregistre d'abord ton pseudo Epic dans ton espace joueur.")
 
     if not replay:
         raise HTTPException(400, "Choisis au moins une rediffusion.")
@@ -700,7 +789,7 @@ async def upload_replay(
         process_replay_batch,
         job_id,
         s["user_id"],
-        s["pseudo"],
+        epic_username,
         files
     )
 
