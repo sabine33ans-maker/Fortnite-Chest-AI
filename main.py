@@ -251,7 +251,13 @@ def analyze_replay(path: Path, expected_pseudo: str):
             result = None
 
         if proc.returncode != 0:
-            return None, (proc.stderr or "Échec du décodeur")[-500:]
+            diagnostic = (proc.stderr or "").strip()
+            if diagnostic:
+                return None, diagnostic[-500:]
+            return None, (
+                f"Le décodeur s'est arrêté avec le code {proc.returncode} sans fournir de détail. "
+                "Le fichier peut être incomplet ou utiliser un format de rediffusion non pris en charge."
+            )
 
         if not isinstance(result, dict):
             return None, "Le décodeur n'a pas renvoyé de résultat valide."
