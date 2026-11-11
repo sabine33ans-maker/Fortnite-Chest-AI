@@ -43,9 +43,11 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 @contextmanager
 def db():
-    con = sqlite3.connect(DB_PATH)
+    # Give concurrent requests time to wait for short SQLite write transactions.
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
     try:
         yield con
         con.commit()
@@ -812,20 +814,22 @@ async def upload_replay(
 @app.get("/api/replays/progress/{job_id}")
 def replay_progress(job_id: str, request: Request):
     s = require_user(request)
-    job = replay_jobs.get(job_id)
 
-    if not job or job["user_id"] != s["user_id"]:
-        raise HTTPException(404, "Analyse introuvable.")
+    with replay_db_lock:
+        job = replay_jobs.get(job_id)
+        if not job or job["user_id"] != s["user_id"]:
+            raise HTTPException(404, "Analyse introuvable.")
+        snapshot = {
+            "total": job["total"],
+            "completed": job["completed"],
+            "percent": job["percent"],
+            "finished": job["finished"],
+            "accepted": job["accepted"],
+            "rejected": job["rejected"],
+            "results": list(job["results"])
+        }
 
-    return {
-        "total": job["total"],
-        "completed": job["completed"],
-        "percent": job["percent"],
-        "finished": job["finished"],
-        "accepted": job["accepted"],
-        "rejected": job["rejected"],
-        "results": job["results"]
-    }
+    return snapshot
 
 
 @app.delete("/api/replays/{replay_id}")
