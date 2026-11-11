@@ -146,8 +146,8 @@ init_db()
 # sont copiés sans interrompre les lectures/écritures du site.
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BACKUP_INTERVAL_SECONDS = 6 * 60 * 60
-BACKUP_KEEP_COUNT = 14
+BACKUP_INTERVAL_SECONDS = 30
+BACKUP_KEEP_COUNT = 120
 
 
 def create_database_backup():
