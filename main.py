@@ -35,7 +35,7 @@ replay_db_lock = threading.Lock()
 
 # One shared pool for the whole server: users share a small, bounded analyzer queue.
 # Keep the default conservative for the Render Starter instance; can be tuned via env.
-REPLAY_WORKERS = max(1, min(4, int(os.environ.get("REPLAY_WORKERS", "3"))))
+REPLAY_WORKERS = max(1, min(4, int(os.environ.get("REPLAY_WORKERS", "2"))))
 replay_executor = ThreadPoolExecutor(max_workers=REPLAY_WORKERS)
 
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
