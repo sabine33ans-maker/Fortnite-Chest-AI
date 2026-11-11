@@ -60,6 +60,9 @@ def db():
 
 def init_db():
     with db() as con:
+        # WAL lets leaderboard/profile reads continue while replay results are written.
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
