@@ -6,11 +6,13 @@ from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import urllib.parse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
@@ -18,6 +20,9 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "chest_ai.sqlite3"
 MAX_UPLOAD = 100 * 1024 * 1024
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "").strip()
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI", "").strip()
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "CHANGE-ME-BEFORE-PUBLISH-" + secrets.token_hex(24))
 ANALYZER_COMMAND = os.environ.get("CHEST_ANALYZER_COMMAND", "dotnet /app/analyzer/ChestReplayCli.dll").strip()
 
@@ -28,14 +33,21 @@ app = FastAPI(title="Fortnite Chest AI")
 replay_jobs = {}
 replay_db_lock = threading.Lock()
 
+# One shared pool for the whole server: users share a small, bounded analyzer queue.
+# Keep the default conservative for the Render Starter instance; can be tuned via env.
+REPLAY_WORKERS = max(1, min(4, int(os.environ.get("REPLAY_WORKERS", "2"))))
+replay_executor = ThreadPoolExecutor(max_workers=REPLAY_WORKERS)
+
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
 @contextmanager
 def db():
-    con = sqlite3.connect(DB_PATH)
+    # Give concurrent requests time to wait for short SQLite write transactions.
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
     try:
         yield con
         con.commit()
@@ -48,6 +60,9 @@ def db():
 
 def init_db():
     with db() as con:
+        # WAL lets leaderboard/profile reads continue while replay results are written.
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +70,8 @@ def init_db():
           password_hash TEXT NOT NULL,
           salt TEXT NOT NULL,
           created_at TEXT NOT NULL,
+          discord_id TEXT UNIQUE,
+          epic_username TEXT NOT NULL DEFAULT '',
           legacy_chests INTEGER NOT NULL DEFAULT 0,
           legacy_matches INTEGER NOT NULL DEFAULT 0
         );
@@ -102,6 +119,17 @@ def init_db():
             con.execute(
                 "ALTER TABLE users ADD COLUMN legacy_matches INTEGER NOT NULL DEFAULT 0"
             )
+        if "discord_id" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN discord_id TEXT")
+        if "epic_username" not in columns:
+            con.execute("ALTER TABLE users ADD COLUMN epic_username TEXT NOT NULL DEFAULT ''")
+
+        # Old SQLite databases do not inherit the UNIQUE constraint from CREATE TABLE.
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_discord_id "
+            "ON users(discord_id) WHERE discord_id IS NOT NULL"
+        )
+        con.execute("UPDATE users SET epic_username=pseudo WHERE epic_username=''")
 
         con.execute(
             """INSERT OR IGNORE INTO legacy_profiles(pseudo,chests,matches)
@@ -153,7 +181,7 @@ def get_session(request: Request):
 
     with db() as con:
         row = con.execute("""
-            SELECT s.*, u.pseudo FROM sessions s
+            SELECT s.*, u.pseudo, u.epic_username FROM sessions s
             LEFT JOIN users u ON u.id=s.user_id
             WHERE s.token_hash=? AND s.expires_at>?
         """, (token_hash, int(time.time()))).fetchone()
@@ -184,7 +212,7 @@ def safe_name(name):
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "rediffusion.replay"
 
 
-def analyze_replay(path: Path, expected_pseudo: str):
+def analyze_replay(path: Path):
     """
     Runs the bundled LED-N ChestCounter parser through the .NET CLI adapter.
     """
@@ -202,7 +230,7 @@ def analyze_replay(path: Path, expected_pseudo: str):
             return None, "Commande de l'analyseur vide."
 
         proc = subprocess.run(
-            [*command, str(path), expected_pseudo],
+            [*command, str(path)],
             capture_output=True,
             text=True,
             timeout=240,
@@ -220,22 +248,27 @@ def analyze_replay(path: Path, expected_pseudo: str):
                 result = None
 
             if isinstance(result, dict) and result.get("ok") is False:
-                return None, str(
-                    result.get("error", "Rediffusion non analysable")
-                )[:500]
+                reason = str(result.get("error", "Rediffusion non analysable"))
+                details = (proc.stderr or "").strip().splitlines()
+                if details:
+                    reason += " — " + details[-1][:200]
+                return None, reason[:500]
         else:
             result = None
 
         if proc.returncode != 0:
-            return None, (proc.stderr or "Échec du décodeur")[-500:]
+            diagnostic = (proc.stderr or "").strip()
+            if diagnostic:
+                return None, diagnostic[-500:]
+            return None, (
+                f"Le décodeur s'est arrêté avec le code {proc.returncode} sans fournir de détail. "
+                "Le fichier peut être incomplet ou utiliser un format de rediffusion non pris en charge."
+            )
 
         if not isinstance(result, dict):
             return None, "Le décodeur n'a pas renvoyé de résultat valide."
 
         player = str(result.get("player_name", "")).strip()
-
-        if player.casefold() != expected_pseudo.casefold():
-            return None, "Le joueur enregistré dans la rediffusion ne correspond pas à ton pseudo."
 
         count = int(result.get("chests_opened", -1))
 
@@ -301,6 +334,7 @@ def me(request: Request):
         "logged_in": True,
         "admin": s["role"] == "admin",
         "pseudo": s.get("pseudo") or "Admin",
+        "epic_username": s.get("epic_username") or "",
         "role": s["role"]
     }
 
@@ -334,15 +368,16 @@ def register(pseudo: str = Form(...), password: str = Form(...)):
 
         cur = con.execute(
             """INSERT INTO users
-            (pseudo,password_hash,salt,created_at,legacy_chests,legacy_matches)
-            VALUES(?,?,?,?,?,?)""",
+            (pseudo,password_hash,salt,created_at,legacy_chests,legacy_matches,epic_username)
+            VALUES(?,?,?,?,?,?,?)""",
             (
                 pseudo,
                 pw_hash,
                 salt,
                 now_iso(),
                 legacy["chests"] if legacy else 0,
-                legacy["matches"] if legacy else 0
+                legacy["matches"] if legacy else 0,
+                pseudo
             )
         )
 
@@ -401,6 +436,71 @@ def login(pseudo: str = Form(...), password: str = Form(...)):
 
     return response
 
+
+
+@app.get("/api/discord/start")
+def discord_start(request: Request):
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI):
+        raise HTTPException(503, "Connexion Discord non configurée sur Render.")
+    state = secrets.token_urlsafe(32)
+    params = urllib.parse.urlencode({"client_id": DISCORD_CLIENT_ID, "redirect_uri": DISCORD_REDIRECT_URI, "response_type": "code", "scope": "identify", "state": state})
+    response = RedirectResponse("https://discord.com/oauth2/authorize?" + params, status_code=302)
+    response.set_cookie("discord_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600, path="/")
+    return response
+
+
+@app.get("/api/discord/callback")
+def discord_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    expected = request.cookies.get("discord_oauth_state", "")
+    if error:
+        return RedirectResponse("/", status_code=303)
+    if not code or not state or not expected or not hmac.compare_digest(state, expected):
+        raise HTTPException(400, "Vérification Discord invalide. Réessaie.")
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI):
+        raise HTTPException(503, "Connexion Discord non configurée sur Render.")
+    body = urllib.parse.urlencode({"client_id": DISCORD_CLIENT_ID, "client_secret": DISCORD_CLIENT_SECRET, "grant_type": "authorization_code", "code": code, "redirect_uri": DISCORD_REDIRECT_URI}).encode()
+    req = urllib.request.Request("https://discord.com/api/oauth2/token", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            token_data = json.loads(r.read().decode())
+        req = urllib.request.Request("https://discord.com/api/users/@me", headers={"Authorization": "Bearer " + token_data["access_token"]})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            profile = json.loads(r.read().decode())
+    except Exception:
+        raise HTTPException(502, "Discord n'a pas pu confirmer ton compte.")
+    discord_id = str(profile.get("id", ""))
+    if not discord_id:
+        raise HTTPException(502, "Identifiant Discord introuvable.")
+    current = get_session(request)
+    with db() as con:
+        found = con.execute("SELECT id FROM users WHERE discord_id=?", (discord_id,)).fetchone()
+        if current and current.get("role") == "viewer" and current.get("user_id"):
+            if found and found["id"] != current["user_id"]:
+                raise HTTPException(409, "Ce compte Discord est déjà lié à un autre compte.")
+            con.execute("UPDATE users SET discord_id=? WHERE id=?", (discord_id, current["user_id"]))
+            uid = current["user_id"]
+        elif found:
+            uid = found["id"]
+        else:
+            response = RedirectResponse("/?discord=link_required", status_code=303)
+            response.delete_cookie("discord_oauth_state", path="/")
+            return response
+    token = new_session(uid, "viewer")
+    response = RedirectResponse("/", status_code=303)
+    response.delete_cookie("discord_oauth_state", path="/")
+    response.set_cookie("chest_session", token, httponly=True, secure=os.environ.get("COOKIE_SECURE", "0") == "1", samesite="lax", max_age=2592000, path="/")
+    return response
+
+
+@app.post("/api/profile/epic")
+def set_epic_username(request: Request, epic_username: str = Form(...)):
+    s = require_user(request)
+    epic_username = epic_username.strip()
+    if not 2 <= len(epic_username) <= 32 or any(ord(c) < 32 for c in epic_username):
+        raise HTTPException(400, "Pseudo Epic invalide (2 à 32 caractères).")
+    with db() as con:
+        con.execute("UPDATE users SET epic_username=? WHERE id=?", (epic_username, s["user_id"]))
+    return {"ok": True, "epic_username": epic_username}
 
 @app.post("/api/admin/login")
 def admin_login(request: Request, code: str = Form(...)):
@@ -523,7 +623,7 @@ def my_replays(request: Request):
     return {"replays": [dict(r) for r in rows]}
 
 
-def process_one_replay(item, user_id, pseudo):
+def process_one_replay(item, user_id):
     result_item = {
         "filename": item["filename"],
         "ok": False,
@@ -546,7 +646,7 @@ def process_one_replay(item, user_id, pseudo):
         if duplicate:
             raise ValueError("Cette rediffusion a déjà été envoyée.")
 
-        result, note = analyze_replay(path, pseudo)
+        result, note = analyze_replay(path)
 
         if not result:
             raise ValueError(note or "Rediffusion non analysable.")
@@ -605,17 +705,24 @@ def process_one_replay(item, user_id, pseudo):
     return result_item
 
 
-def process_replay_batch(job_id, user_id, pseudo, files):
+def process_replay_batch(job_id, user_id, files):
     job = replay_jobs[job_id]
+    futures = {
+        replay_executor.submit(process_one_replay, item, user_id): item
+        for item in files
+    }
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [
-            executor.submit(process_one_replay, item, user_id, pseudo)
-            for item in files
-        ]
-
+    try:
         for future in as_completed(futures):
-            result_item = future.result()
+            item = futures[future]
+            try:
+                result_item = future.result()
+            except Exception as exc:
+                result_item = {
+                    "filename": item.get("filename", "rediffusion.replay"),
+                    "ok": False,
+                    "error": f"Erreur interne d'analyse : {type(exc).__name__}"
+                }
 
             with replay_db_lock:
                 job["results"].append(result_item)
@@ -624,12 +731,14 @@ def process_replay_batch(job_id, user_id, pseudo, files):
                     job["completed"] / job["total"] * 100
                 )
 
-    job["finished"] = True
-    job["percent"] = 100
-    job["accepted"] = sum(
-        1 for r in job["results"] if r["ok"]
-    )
-    job["rejected"] = job["total"] - job["accepted"]
+    finally:
+        with replay_db_lock:
+            job["finished"] = True
+            job["percent"] = 100
+            job["accepted"] = sum(
+                1 for r in job["results"] if r.get("ok")
+            )
+            job["rejected"] = job["total"] - job["accepted"]
 
 
 @app.post("/api/replays")
@@ -639,7 +748,6 @@ async def upload_replay(
     replay: list[UploadFile] = File(...)
 ):
     s = require_user(request)
-
     if not replay:
         raise HTTPException(400, "Choisis au moins une rediffusion.")
 
@@ -700,7 +808,6 @@ async def upload_replay(
         process_replay_batch,
         job_id,
         s["user_id"],
-        s["pseudo"],
         files
     )
 
@@ -714,20 +821,22 @@ async def upload_replay(
 @app.get("/api/replays/progress/{job_id}")
 def replay_progress(job_id: str, request: Request):
     s = require_user(request)
-    job = replay_jobs.get(job_id)
 
-    if not job or job["user_id"] != s["user_id"]:
-        raise HTTPException(404, "Analyse introuvable.")
+    with replay_db_lock:
+        job = replay_jobs.get(job_id)
+        if not job or job["user_id"] != s["user_id"]:
+            raise HTTPException(404, "Analyse introuvable.")
+        snapshot = {
+            "total": job["total"],
+            "completed": job["completed"],
+            "percent": job["percent"],
+            "finished": job["finished"],
+            "accepted": job["accepted"],
+            "rejected": job["rejected"],
+            "results": list(job["results"])
+        }
 
-    return {
-        "total": job["total"],
-        "completed": job["completed"],
-        "percent": job["percent"],
-        "finished": job["finished"],
-        "accepted": job["accepted"],
-        "rejected": job["rejected"],
-        "results": job["results"]
-    }
+    return snapshot
 
 
 @app.delete("/api/replays/{replay_id}")

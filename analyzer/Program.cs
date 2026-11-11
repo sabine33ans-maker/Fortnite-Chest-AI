@@ -7,27 +7,18 @@ static int Fail(string message)
     return 2;
 }
 
-if (args.Length != 2)
-    return Fail("Usage: ChestReplayCli <replay-file> <expected-player-name>");
+if (args.Length != 1)
+    return Fail("Usage: ChestReplayCli <replay-file>");
 
 var replayPath = Path.GetFullPath(args[0]);
-var expectedPlayer = args[1].Trim();
 if (!File.Exists(replayPath))
     return Fail("Replay file not found.");
-if (string.IsNullOrWhiteSpace(expectedPlayer))
-    return Fail("Expected player name is empty.");
-
 try
 {
     using var stream = new FileStream(replayPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-    var record = new ReplayAnalyzer().Analyze(stream, Path.GetFileName(replayPath), expectedPlayer);
+    var record = new ReplayAnalyzer().Analyze(stream, Path.GetFileName(replayPath), null);
 
-    // ChestCounter only tracks the exact configured Epic display name when one is supplied.
-    // Never fall back to the replay recorder or a teammate if the requested player was not found.
-    if (!record.TrackedByUsername ||
-        string.IsNullOrWhiteSpace(record.PlayerName) ||
-        !string.Equals(record.PlayerName.Trim(), expectedPlayer, StringComparison.OrdinalIgnoreCase))
-        return Fail("The requested Epic player was not found in this replay.");
+    // No Epic name is forced: ChestCounter automatically follows the replay recorder.
 
     if (!record.IsBattleRoyale)
         return Fail("This replay is not a supported Battle Royale match.");
