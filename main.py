@@ -463,15 +463,9 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         elif found:
             uid = found["id"]
         else:
-            raw = str(profile.get("global_name") or profile.get("username") or "Joueur")
-            base = re.sub(r"[^A-Za-z0-9 _.-]", "", raw).strip()[:24] or "Joueur"
-            pseudo, n = base, 2
-            while con.execute("SELECT 1 FROM users WHERE pseudo=? COLLATE NOCASE", (pseudo,)).fetchone():
-                tail = "_" + str(n)
-                pseudo, n = base[:32-len(tail)] + tail, n + 1
-            ph, salt = hash_password(secrets.token_urlsafe(40))
-            cur = con.execute("INSERT INTO users(pseudo,password_hash,salt,created_at,discord_id,epic_username) VALUES(?,?,?,?,?,?)", (pseudo, ph, salt, now_iso(), discord_id, ""))
-            uid = cur.lastrowid
+            response = RedirectResponse("/?discord=link_required", status_code=303)
+            response.delete_cookie("discord_oauth_state", path="/")
+            return response
     token = new_session(uid, "viewer")
     response = RedirectResponse("/", status_code=303)
     response.delete_cookie("discord_oauth_state", path="/")
