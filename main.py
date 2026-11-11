@@ -212,7 +212,7 @@ def safe_name(name):
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:120] or "rediffusion.replay"
 
 
-def analyze_replay(path: Path, expected_pseudo: str):
+def analyze_replay(path: Path):
     """
     Runs the bundled LED-N ChestCounter parser through the .NET CLI adapter.
     """
@@ -230,7 +230,7 @@ def analyze_replay(path: Path, expected_pseudo: str):
             return None, "Commande de l'analyseur vide."
 
         proc = subprocess.run(
-            [*command, str(path), expected_pseudo],
+            [*command, str(path)],
             capture_output=True,
             text=True,
             timeout=240,
@@ -269,9 +269,6 @@ def analyze_replay(path: Path, expected_pseudo: str):
             return None, "Le décodeur n'a pas renvoyé de résultat valide."
 
         player = str(result.get("player_name", "")).strip()
-
-        if player.casefold() != expected_pseudo.casefold():
-            return None, "Le joueur enregistré dans la rediffusion ne correspond pas à ton pseudo."
 
         count = int(result.get("chests_opened", -1))
 
@@ -626,7 +623,7 @@ def my_replays(request: Request):
     return {"replays": [dict(r) for r in rows]}
 
 
-def process_one_replay(item, user_id, pseudo):
+def process_one_replay(item, user_id):
     result_item = {
         "filename": item["filename"],
         "ok": False,
@@ -649,7 +646,7 @@ def process_one_replay(item, user_id, pseudo):
         if duplicate:
             raise ValueError("Cette rediffusion a déjà été envoyée.")
 
-        result, note = analyze_replay(path, pseudo)
+        result, note = analyze_replay(path)
 
         if not result:
             raise ValueError(note or "Rediffusion non analysable.")
@@ -708,10 +705,10 @@ def process_one_replay(item, user_id, pseudo):
     return result_item
 
 
-def process_replay_batch(job_id, user_id, pseudo, files):
+def process_replay_batch(job_id, user_id, files):
     job = replay_jobs[job_id]
     futures = {
-        replay_executor.submit(process_one_replay, item, user_id, pseudo): item
+        replay_executor.submit(process_one_replay, item, user_id): item
         for item in files
     }
 
@@ -751,10 +748,6 @@ async def upload_replay(
     replay: list[UploadFile] = File(...)
 ):
     s = require_user(request)
-    epic_username = (s.get("epic_username") or "").strip()
-    if not epic_username:
-        raise HTTPException(400, "Enregistre d'abord ton pseudo Epic dans ton espace joueur.")
-
     if not replay:
         raise HTTPException(400, "Choisis au moins une rediffusion.")
 
@@ -815,7 +808,6 @@ async def upload_replay(
         process_replay_batch,
         job_id,
         s["user_id"],
-        epic_username,
         files
     )
 
