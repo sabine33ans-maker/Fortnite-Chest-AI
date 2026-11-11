@@ -123,6 +123,12 @@ def init_db():
             con.execute("ALTER TABLE users ADD COLUMN discord_id TEXT")
         if "epic_username" not in columns:
             con.execute("ALTER TABLE users ADD COLUMN epic_username TEXT NOT NULL DEFAULT ''")
+
+        # Old SQLite databases do not inherit the UNIQUE constraint from CREATE TABLE.
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_discord_id "
+            "ON users(discord_id) WHERE discord_id IS NOT NULL"
+        )
         con.execute("UPDATE users SET epic_username=pseudo WHERE epic_username=''")
 
         con.execute(
